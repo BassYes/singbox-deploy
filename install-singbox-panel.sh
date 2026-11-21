@@ -44,6 +44,61 @@ check_root() {
 }
 
 check_root
+PACKAGE_UMASK=$(umask)
+umask 077
+
+run_package_command() (
+    umask "$PACKAGE_UMASK"
+    "$@"
+)
+
+# 收紧现有凭据权限，并拒绝异常的文件类型或所有者。
+protect_credential_file() {
+    local file="$1"
+    if [[ -L "$file" || ( -e "$file" && ( ! -f "$file" || ! -O "$file" ) ) ]]; then
+        err "凭据路径不是当前用户拥有的常规文件: $file"
+        return 1
+    fi
+    if [[ -f "$file" ]]; then
+        chmod 0600 -- "$file"
+    fi
+}
+
+protect_credentials() {
+    local path
+    for path in /etc/sing-box /etc/sing-box/certs; do
+        if [[ -L "$path" || ( -e "$path" && ( ! -d "$path" || ! -O "$path" ) ) ]]; then
+            err "配置路径不是当前用户拥有的目录: $path"
+            return 1
+        fi
+        if [[ -d "$path" ]]; then
+            chmod 0700 -- "$path" || return 1
+        fi
+    done
+    for path in /etc/sing-box/{config.json,config.json.bak,config.json.tmp,.protocols,.config_cache,.config_cache.tmp,.config_cache.tmp2,.reality_pub,.reality_sid,uris.txt,ss_uri.txt,relay_uri.txt,certs/privkey.pem} "$@"; do
+        protect_credential_file "$path" || return 1
+    done
+}
+
+if [[ "${1:-}" == --harden-existing ]]; then
+    if [[ ! -f /etc/sing-box/config.json ]]; then
+        err "未找到现有配置: /etc/sing-box/config.json"
+        exit 1
+    fi
+    if [[ -L /usr/local/bin/sb || ! -f /usr/local/bin/sb || ! -O /usr/local/bin/sb ]] ||
+        ! grep -Eq '^SERVICE_NAME="(sing-box|\$\{SERVICE_NAME:-sing-box\})"$' /usr/local/bin/sb ||
+        ! grep -q '^action_uninstall()' /usr/local/bin/sb; then
+        err "未识别到本项目安装的 sb 管理脚本: /usr/local/bin/sb"
+        exit 1
+    fi
+    protect_credentials
+    for legacy_file in /tmp/relay-install.sh '/tmp/singbox_inbounds_$.json'; do
+        if [[ -e "$legacy_file" || -L "$legacy_file" ]]; then
+            warn "发现旧版临时文件，请核对并清理: $legacy_file"
+        fi
+    done
+else
+    protect_credentials
 
 # -----------------------
 # 安装依赖
@@ -52,8 +107,8 @@ install_deps() {
     
     case "$OS" in
         alpine)
-            apk update || { err "apk update 失败"; exit 1; }
-            apk add --no-cache bash curl ca-certificates openssl openrc || {
+            run_package_command apk update || { err "apk update 失败"; exit 1; }
+            run_package_command apk add --no-cache bash curl ca-certificates openssl openrc || {
                 err "依赖安装失败"
                 exit 1
             }
@@ -66,14 +121,14 @@ install_deps() {
             ;;
         debian)
             export DEBIAN_FRONTEND=noninteractive
-            apt-get update -y || { err "apt update 失败"; exit 1; }
-            apt-get install -y curl ca-certificates openssl || {
+            run_package_command apt-get update -y || { err "apt update 失败"; exit 1; }
+            run_package_command apt-get install -y curl ca-certificates openssl || {
                 err "依赖安装失败"
                 exit 1
             }
             ;;
         redhat)
-            yum install -y curl ca-certificates openssl || {
+            run_package_command yum install -y curl ca-certificates openssl || {
                 err "依赖安装失败"
                 exit 1
             }
@@ -140,15 +195,15 @@ install_singbox() {
     case "$OS" in
         alpine)
             info "使用 Edge 仓库安装 sing-box"
-            apk update || { err "apk update 失败"; exit 1; }
-            apk add --repository=http://dl-cdn.alpinelinux.org/alpine/edge/community sing-box || {
+            run_package_command apk update || { err "apk update 失败"; exit 1; }
+            run_package_command apk add --repository=http://dl-cdn.alpinelinux.org/alpine/edge/community sing-box || {
                 err "sing-box 安装失败"
                 exit 1
             }
             ;;
         debian|redhat)
             # 原官方安装脚本
-            bash <(curl -fsSL https://sing-box.app/install.sh) || {
+            run_package_command bash <(curl -fsSL https://sing-box.app/install.sh) || {
                 err "sing-box 安装失败"
                 err "请检查网络连接或手动安装"
                 exit 1
@@ -171,6 +226,7 @@ install_singbox() {
 }
 
 install_singbox
+protect_credentials
 
 # -----------------------
 # 生成密码
@@ -403,7 +459,7 @@ generate_uri() {
     # SIP002 格式 (URL编码)
     local encoded_userinfo
     if command -v python3 >/dev/null 2>&1; then
-        encoded_userinfo=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$userinfo" 2>/dev/null || echo "$userinfo")
+        encoded_userinfo=$(printf '%s' "$userinfo" | python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.stdin.read(), safe=''))" 2>/dev/null || echo "$userinfo")
     else
         encoded_userinfo=$(printf "%s" "$userinfo" | sed 's/:/%3A/g; s/+/%2B/g; s/\//%2F/g; s/=/%3D/g')
     fi
@@ -425,7 +481,6 @@ echo ""
 info "📋 配置信息："
 echo "   端口: $PORT"
 echo "   方法: $METHOD"
-echo "   密码: $PSK"
 echo "   服务器: $PUB_IP"
 echo ""
 info "📁 文件位置："
@@ -433,9 +488,8 @@ echo "   配置: $CONFIG_PATH"
 echo "   服务: $SERVICE_PATH"
 echo ""
 info "🔗 客户端链接："
-generate_uri | while IFS= read -r line; do
-    echo "   $line"
-done
+generate_uri > /etc/sing-box/ss_uri.txt
+info "客户端链接已保存到 /etc/sing-box/ss_uri.txt"
 echo ""
 info "🔧 管理命令："
 if [ "$OS" = "alpine" ]; then
@@ -457,13 +511,28 @@ echo "=========================================="
 # -----------------------
 # Create `sb` management script at /usr/local/bin/sb
 # (Do not modify other parts of the original script; sb is added as a separate tool)
+fi
+
 SB_PATH="/usr/local/bin/sb"
+SB_TEMP=$(mktemp "${SB_PATH}.XXXXXX")
+trap 'rm -f -- "$SB_TEMP"' EXIT
 
 info "正在创建 sb 管理脚本: $SB_PATH"
 
-cat > "$SB_PATH" <<'SB_SCRIPT'
+cat > "$SB_TEMP" <<'SB_SCRIPT'
 #!/usr/bin/env bash
 set -euo pipefail
+PACKAGE_UMASK=$(umask)
+umask 077
+
+run_package_command() (
+    umask "$PACKAGE_UMASK"
+    "$@"
+)
+if [[ $EUID -ne 0 ]]; then
+    printf '%s\n' '请以 root 运行 sb。' >&2
+    exit 1
+fi
 
 # Simple Sing-box manager (sb)
 # Supports: view SS URI, view config path, edit config, reset port/password,
@@ -502,6 +571,35 @@ detect_os() {
     fi
 }
 
+# 收紧现有凭据权限，并拒绝异常的文件类型或所有者。
+protect_credential_file() {
+    local file="$1"
+    if [[ -L "$file" || ( -e "$file" && ( ! -f "$file" || ! -O "$file" ) ) ]]; then
+        err "凭据路径不是当前用户拥有的常规文件: $file"
+        return 1
+    fi
+    if [[ -f "$file" ]]; then
+        chmod 0600 -- "$file"
+    fi
+}
+
+protect_credentials() {
+    local path
+    for path in /etc/sing-box /etc/sing-box/certs; do
+        if [[ -L "$path" || ( -e "$path" && ( ! -d "$path" || ! -O "$path" ) ) ]]; then
+            err "配置路径不是当前用户拥有的目录: $path"
+            return 1
+        fi
+        if [[ -d "$path" ]]; then
+            chmod 0700 -- "$path" || return 1
+        fi
+    done
+    for path in /etc/sing-box/{config.json,config.json.bak,config.json.tmp,.protocols,.config_cache,.config_cache.tmp,.config_cache.tmp2,.reality_pub,.reality_sid,uris.txt,ss_uri.txt,relay_uri.txt,certs/privkey.pem} "$@"; do
+        protect_credential_file "$path" || return 1
+    done
+}
+
+protect_credentials "$CONFIG_PATH" "${CONFIG_PATH}.bak" "${CONFIG_PATH}.tmp" "${URI_PATH:-${SS_URI_PATH:-/etc/sing-box/uris.txt}}"
 detect_os
 
 # service helpers
@@ -602,11 +700,7 @@ generate_and_save_uri() {
 
     # url-encoded userinfo
     if command -v python3 >/dev/null 2>&1; then
-        encoded_userinfo=$(python3 - <<PY
-import urllib.parse,sys
-print(urllib.parse.quote(sys.argv[1], safe=''))
-PY
-"$userinfo")
+        encoded_userinfo=$(printf '%s' "$userinfo" | python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.stdin.read(), safe=''))")
     else
         encoded_userinfo=$(printf "%s" "$userinfo" | sed 's/:/%3A/g; s/+/%2B/g; s/\//%2F/g; s/=/%3D/g')
     fi
@@ -712,13 +806,13 @@ EOF
 action_update() {
     info "开始更新 sing-box..."
     if [ "$OS" = "alpine" ]; then
-        apk update || warn "apk update 失败"
-        apk add --upgrade --repository=http://dl-cdn.alpinelinux.org/alpine/edge/community sing-box || {
+        run_package_command apk update || warn "apk update 失败"
+        run_package_command apk add --upgrade --repository=http://dl-cdn.alpinelinux.org/alpine/edge/community sing-box || {
             warn "apk 更新失败，尝试用官方安装脚本"
-            bash <(curl -fsSL https://sing-box.app/install.sh) || err "更新失败"
+            run_package_command bash <(curl -fsSL https://sing-box.app/install.sh) || err "更新失败"
         }
     else
-        bash <(curl -fsSL https://sing-box.app/install.sh) || err "更新失败"
+        run_package_command bash <(curl -fsSL https://sing-box.app/install.sh) || err "更新失败"
     fi
 
     info "更新完成，重启服务..."
@@ -738,7 +832,7 @@ action_uninstall() {
     if [ "$OS" = "alpine" ]; then
         rc-update del "$SERVICE_NAME" default >/dev/null 2>&1 || true
         [ -f "/etc/init.d/$SERVICE_NAME" ] && rm -f "/etc/init.d/$SERVICE_NAME"
-        apk del sing-box >/dev/null 2>&1 || true
+        run_package_command apk del sing-box >/dev/null 2>&1 || true
     else
         systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
         systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
@@ -791,7 +885,8 @@ done
 SB_SCRIPT
 
 # set executable
-chmod +x "$SB_PATH" || warn "无法设置 $SB_PATH 为可执行"
+chmod 0700 "$SB_TEMP"
+mv -fT -- "$SB_TEMP" "$SB_PATH"
 
 info "sb 已创建：请输入 sb 运行管理面板"
 

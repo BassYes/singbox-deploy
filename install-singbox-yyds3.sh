@@ -44,6 +44,61 @@ check_root() {
 }
 
 check_root
+PACKAGE_UMASK=$(umask)
+umask 077
+
+run_package_command() (
+    umask "$PACKAGE_UMASK"
+    "$@"
+)
+
+# 收紧现有凭据权限，并拒绝异常的文件类型或所有者。
+protect_credential_file() {
+    local file="$1"
+    if [[ -L "$file" || ( -e "$file" && ( ! -f "$file" || ! -O "$file" ) ) ]]; then
+        err "凭据路径不是当前用户拥有的常规文件: $file"
+        return 1
+    fi
+    if [[ -f "$file" ]]; then
+        chmod 0600 -- "$file"
+    fi
+}
+
+protect_credentials() {
+    local path
+    for path in /etc/sing-box /etc/sing-box/certs; do
+        if [[ -L "$path" || ( -e "$path" && ( ! -d "$path" || ! -O "$path" ) ) ]]; then
+            err "配置路径不是当前用户拥有的目录: $path"
+            return 1
+        fi
+        if [[ -d "$path" ]]; then
+            chmod 0700 -- "$path" || return 1
+        fi
+    done
+    for path in /etc/sing-box/{config.json,config.json.bak,config.json.tmp,.protocols,.config_cache,.config_cache.tmp,.config_cache.tmp2,.reality_pub,.reality_sid,uris.txt,ss_uri.txt,relay_uri.txt,certs/privkey.pem} "$@"; do
+        protect_credential_file "$path" || return 1
+    done
+}
+
+if [[ "${1:-}" == --harden-existing ]]; then
+    if [[ ! -f /etc/sing-box/config.json ]]; then
+        err "未找到现有配置: /etc/sing-box/config.json"
+        exit 1
+    fi
+    if [[ -L /usr/local/bin/sb || ! -f /usr/local/bin/sb || ! -O /usr/local/bin/sb ]] ||
+        ! grep -Eq '^SERVICE_NAME="(sing-box|\$\{SERVICE_NAME:-sing-box\})"$' /usr/local/bin/sb ||
+        ! grep -q '^action_uninstall()' /usr/local/bin/sb; then
+        err "未识别到本项目安装的 sb 管理脚本: /usr/local/bin/sb"
+        exit 1
+    fi
+    protect_credentials
+    for legacy_file in /tmp/relay-install.sh '/tmp/singbox_inbounds_$.json'; do
+        if [[ -e "$legacy_file" || -L "$legacy_file" ]]; then
+            warn "发现旧版临时文件，请核对并清理: $legacy_file"
+        fi
+    done
+else
+    protect_credentials
 
 # -----------------------
 # 安装依赖
@@ -52,22 +107,22 @@ install_deps() {
     
     case "$OS" in
         alpine)
-            apk update || { err "apk update 失败"; exit 1; }
-            apk add --no-cache bash curl ca-certificates openssl openrc jq || {
+            run_package_command apk update || { err "apk update 失败"; exit 1; }
+            run_package_command apk add --no-cache bash curl ca-certificates openssl openrc jq || {
                 err "依赖安装失败"
                 exit 1
             }
             ;;
         debian)
             export DEBIAN_FRONTEND=noninteractive
-            apt-get update -y || { err "apt update 失败"; exit 1; }
-            apt-get install -y curl ca-certificates openssl jq || {
+            run_package_command apt-get update -y || { err "apt update 失败"; exit 1; }
+            run_package_command apt-get install -y curl ca-certificates openssl jq || {
                 err "依赖安装失败"
                 exit 1
             }
             ;;
         redhat)
-            yum install -y curl ca-certificates openssl jq || {
+            run_package_command yum install -y curl ca-certificates openssl jq || {
                 err "依赖安装失败"
                 exit 1
             }
@@ -276,14 +331,14 @@ install_singbox() {
     case "$OS" in
         alpine)
             info "使用 Edge 仓库安装 sing-box"
-            apk update || { err "apk update 失败"; exit 1; }
-            apk add --repository=http://dl-cdn.alpinelinux.org/alpine/edge/community sing-box || {
+            run_package_command apk update || { err "apk update 失败"; exit 1; }
+            run_package_command apk add --repository=http://dl-cdn.alpinelinux.org/alpine/edge/community sing-box || {
                 err "sing-box 安装失败"
                 exit 1
             }
             ;;
         debian|redhat)
-            bash <(curl -fsSL https://sing-box.app/install.sh) || {
+            run_package_command bash <(curl -fsSL https://sing-box.app/install.sh) || {
                 err "sing-box 安装失败"
                 exit 1
             }
@@ -304,6 +359,7 @@ install_singbox() {
 }
 
 install_singbox
+protect_credentials
 
 # -----------------------
 # 生成 Reality 密钥对（必须在 sing-box 安装之后）
@@ -378,14 +434,15 @@ generate_cert
 # 生成配置文件
 CONFIG_PATH="/etc/sing-box/config.json"
 
-create_config() {
+create_config() (
     info "生成配置文件: $CONFIG_PATH"
 
     mkdir -p "$(dirname "$CONFIG_PATH")"
 
     # 构建 inbounds 内容（使用临时文件避免字符串处理问题）
-    local TEMP_INBOUNDS="/tmp/singbox_inbounds_$.json"
-    > "$TEMP_INBOUNDS"
+    local TEMP_INBOUNDS
+    TEMP_INBOUNDS=$(mktemp "$(dirname "$CONFIG_PATH")/.inbounds.XXXXXX")
+    trap 'rm -f -- "$TEMP_INBOUNDS"' EXIT
     
     local need_comma=false
     
@@ -400,8 +457,8 @@ create_config() {
       "tag": "ss-in"
     }
 INBOUND_SS
-        sed -i "s|PORT_SS_PLACEHOLDER|$PORT_SS|g" "$TEMP_INBOUNDS"
-        sed -i "s|PSK_SS_PLACEHOLDER|$PSK_SS|g" "$TEMP_INBOUNDS"
+        printf '%s\n' "s|PORT_SS_PLACEHOLDER|$PORT_SS|g" | sed -i -f /dev/stdin "$TEMP_INBOUNDS"
+        printf '%s\n' "s|PSK_SS_PLACEHOLDER|$PSK_SS|g" | sed -i -f /dev/stdin "$TEMP_INBOUNDS"
         need_comma=true
     fi
     
@@ -426,8 +483,8 @@ INBOUND_SS
       }
     }
 INBOUND_HY2
-        sed -i "s|PORT_HY2_PLACEHOLDER|$PORT_HY2|g" "$TEMP_INBOUNDS"
-        sed -i "s|PSK_HY2_PLACEHOLDER|$PSK_HY2|g" "$TEMP_INBOUNDS"
+        printf '%s\n' "s|PORT_HY2_PLACEHOLDER|$PORT_HY2|g" | sed -i -f /dev/stdin "$TEMP_INBOUNDS"
+        printf '%s\n' "s|PSK_HY2_PLACEHOLDER|$PSK_HY2|g" | sed -i -f /dev/stdin "$TEMP_INBOUNDS"
         need_comma=true
     fi
     
@@ -454,9 +511,9 @@ INBOUND_HY2
       }
     }
 INBOUND_TUIC
-        sed -i "s|PORT_TUIC_PLACEHOLDER|$PORT_TUIC|g" "$TEMP_INBOUNDS"
-        sed -i "s|UUID_TUIC_PLACEHOLDER|$UUID_TUIC|g" "$TEMP_INBOUNDS"
-        sed -i "s|PSK_TUIC_PLACEHOLDER|$PSK_TUIC|g" "$TEMP_INBOUNDS"
+        printf '%s\n' "s|PORT_TUIC_PLACEHOLDER|$PORT_TUIC|g" | sed -i -f /dev/stdin "$TEMP_INBOUNDS"
+        printf '%s\n' "s|UUID_TUIC_PLACEHOLDER|$UUID_TUIC|g" | sed -i -f /dev/stdin "$TEMP_INBOUNDS"
+        printf '%s\n' "s|PSK_TUIC_PLACEHOLDER|$PSK_TUIC|g" | sed -i -f /dev/stdin "$TEMP_INBOUNDS"
         need_comma=true
     fi
     
@@ -489,10 +546,10 @@ INBOUND_TUIC
       }
     }
 INBOUND_REALITY
-        sed -i "s|PORT_REALITY_PLACEHOLDER|$PORT_REALITY|g" "$TEMP_INBOUNDS"
-        sed -i "s|UUID_REALITY_PLACEHOLDER|$UUID|g" "$TEMP_INBOUNDS"
-        sed -i "s|REALITY_PK_PLACEHOLDER|$REALITY_PK|g" "$TEMP_INBOUNDS"
-        sed -i "s|REALITY_SID_PLACEHOLDER|$REALITY_SID|g" "$TEMP_INBOUNDS"
+        printf '%s\n' "s|PORT_REALITY_PLACEHOLDER|$PORT_REALITY|g" | sed -i -f /dev/stdin "$TEMP_INBOUNDS"
+        printf '%s\n' "s|UUID_REALITY_PLACEHOLDER|$UUID|g" | sed -i -f /dev/stdin "$TEMP_INBOUNDS"
+        printf '%s\n' "s|REALITY_PK_PLACEHOLDER|$REALITY_PK|g" | sed -i -f /dev/stdin "$TEMP_INBOUNDS"
+        printf '%s\n' "s|REALITY_SID_PLACEHOLDER|$REALITY_SID|g" | sed -i -f /dev/stdin "$TEMP_INBOUNDS"
     fi
 
     # 生成最终配置
@@ -518,7 +575,6 @@ CONFIG_HEAD
 }
 CONFIG_TAIL
 
-    rm -f "$TEMP_INBOUNDS"
 
     sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1 \
        && info "配置文件验证通过" \
@@ -558,7 +614,7 @@ REALITY_PUB=$REALITY_PUB
 CACHEEOF
 
     info "配置缓存已保存到 /etc/sing-box/.config_cache"
-}
+)
 
 # 调用配置生成
 create_config
@@ -732,10 +788,10 @@ info "🎉 Sing-box 部署完成!"
 echo "=========================================="
 echo ""
 info "📋 配置信息:"
-$ENABLE_SS && echo "   SS 端口: $PORT_SS | 密码: $PSK_SS"
-$ENABLE_HY2 && echo "   HY2 端口: $PORT_HY2 | 密码: $PSK_HY2"
-$ENABLE_TUIC && echo "   TUIC 端口: $PORT_TUIC | UUID: $UUID_TUIC | 密码: $PSK_TUIC"
-$ENABLE_REALITY && echo "   Reality 端口: $PORT_REALITY | UUID: $UUID"
+$ENABLE_SS && echo "   SS 端口: $PORT_SS"
+$ENABLE_HY2 && echo "   HY2 端口: $PORT_HY2"
+$ENABLE_TUIC && echo "   TUIC 端口: $PORT_TUIC"
+$ENABLE_REALITY && echo "   Reality 端口: $PORT_REALITY"
 echo "   服务器: $PUB_IP"
 echo ""
 info "📂 文件位置:"
@@ -744,9 +800,8 @@ echo "   配置: $CONFIG_PATH"
 echo "   服务: $SERVICE_PATH"
 echo ""
 info "📜 客户端链接:"
-generate_uris | while IFS= read -r line; do
-    echo "   $line"
-done
+generate_uris > /etc/sing-box/uris.txt
+info "客户端链接已保存到 /etc/sing-box/uris.txt"
 echo ""
 info "🔧 管理命令:"
 if [ "$OS" = "alpine" ]; then
@@ -768,12 +823,27 @@ echo "=========================================="
 
 # -----------------------
 # 创建 sb 管理脚本
+fi
+
 SB_PATH="/usr/local/bin/sb"
+SB_TEMP=$(mktemp "${SB_PATH}.XXXXXX")
+trap 'rm -f -- "$SB_TEMP"' EXIT
 info "正在创建 sb 管理脚本: $SB_PATH"
 
-cat > "$SB_PATH" <<'SB_SCRIPT'
+cat > "$SB_TEMP" <<'SB_SCRIPT'
 #!/usr/bin/env bash
 set -euo pipefail
+PACKAGE_UMASK=$(umask)
+umask 077
+
+run_package_command() (
+    umask "$PACKAGE_UMASK"
+    "$@"
+)
+if [[ $EUID -ne 0 ]]; then
+    printf '%s\n' '请以 root 运行 sb。' >&2
+    exit 1
+fi
 
 info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
 warn() { echo -e "\033[1;33m[WARN]\033[0m $*"; }
@@ -805,6 +875,35 @@ detect_os() {
     fi
 }
 
+# 收紧现有凭据权限，并拒绝异常的文件类型或所有者。
+protect_credential_file() {
+    local file="$1"
+    if [[ -L "$file" || ( -e "$file" && ( ! -f "$file" || ! -O "$file" ) ) ]]; then
+        err "凭据路径不是当前用户拥有的常规文件: $file"
+        return 1
+    fi
+    if [[ -f "$file" ]]; then
+        chmod 0600 -- "$file"
+    fi
+}
+
+protect_credentials() {
+    local path
+    for path in /etc/sing-box /etc/sing-box/certs; do
+        if [[ -L "$path" || ( -e "$path" && ( ! -d "$path" || ! -O "$path" ) ) ]]; then
+            err "配置路径不是当前用户拥有的目录: $path"
+            return 1
+        fi
+        if [[ -d "$path" ]]; then
+            chmod 0700 -- "$path" || return 1
+        fi
+    done
+    for path in /etc/sing-box/{config.json,config.json.bak,config.json.tmp,.protocols,.config_cache,.config_cache.tmp,.config_cache.tmp2,.reality_pub,.reality_sid,uris.txt,ss_uri.txt,relay_uri.txt,certs/privkey.pem} "$@"; do
+        protect_credential_file "$path" || return 1
+    done
+}
+
+protect_credentials "$CONFIG_PATH" "${CONFIG_PATH}.bak" "${CONFIG_PATH}.tmp" "${URI_PATH:-${SS_URI_PATH:-/etc/sing-box/uris.txt}}"
 detect_os
 
 # 服务控制
@@ -832,6 +931,34 @@ url_encode() {
 }
 
 # 读取配置
+# 兼容旧版 KEY=VALUE 数据。只读取允许的字段，值始终作为字面文本。
+load_cache_data() {
+    local file="$1" line key value
+    [[ -f "$file" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" == *=* ]] || continue
+        key=${line%%=*}
+        value=${line#*=}
+        value=${value%$'\r'}
+        case "$key" in
+            ENABLE_SS|ENABLE_HY2|ENABLE_TUIC|ENABLE_REALITY|ENABLE_ANYTLS)
+                [[ "$value" == true || "$value" == false ]] || continue
+                ;;
+            CUSTOM_IP)
+                [[ "$value" =~ ^[][a-zA-Z0-9.:-]*$ ]] || continue
+                ;;
+            REALITY_SNI)
+                [[ "$value" =~ ^[a-zA-Z0-9.-]+$ ]] || continue
+                ;;
+            REALITY_PUB)
+                [[ "$value" =~ ^[a-zA-Z0-9_=-]+$ ]] || continue
+                ;;
+            *) continue ;;
+        esac
+        printf -v "$key" '%s' "$value"
+    done < "$file"
+}
+
 read_config() {
     if [ ! -f "$CONFIG_PATH" ]; then
         err "未找到配置文件: $CONFIG_PATH"
@@ -841,12 +968,12 @@ read_config() {
     # 优先加载 .protocols 文件（权威协议标记）
     PROTOCOL_FILE="/etc/sing-box/.protocols"
     if [ -f "$PROTOCOL_FILE" ]; then
-        . "$PROTOCOL_FILE"
+        load_cache_data "$PROTOCOL_FILE"
     fi
     
     # 再加载缓存文件（包含端口密码等详细配置）
     if [ -f "$CACHE_FILE" ]; then
-        . "$CACHE_FILE"
+        load_cache_data "$CACHE_FILE"
     fi
     
     # 读取各协议配置
@@ -1075,9 +1202,9 @@ action_reset_reality() {
 action_update() {
     info "开始更新 sing-box..."
     if [ "$OS" = "alpine" ]; then
-        apk update && apk upgrade sing-box || bash <(curl -fsSL https://sing-box.app/install.sh)
+        run_package_command apk update && run_package_command apk upgrade sing-box || run_package_command bash <(curl -fsSL https://sing-box.app/install.sh)
     else
-        bash <(curl -fsSL https://sing-box.app/install.sh)
+        run_package_command bash <(curl -fsSL https://sing-box.app/install.sh)
     fi
     
     info "更新完成,尝试重启服务..."
@@ -1098,7 +1225,7 @@ action_uninstall() {
     if [ "$OS" = "alpine" ]; then
         rc-update del sing-box default 2>/dev/null || true
         rm -f /etc/init.d/sing-box
-        apk del sing-box 2>/dev/null || true
+        run_package_command apk del sing-box 2>/dev/null || true
     else
         systemctl stop sing-box 2>/dev/null || true
         systemctl disable sing-box 2>/dev/null || true
@@ -1134,7 +1261,7 @@ action_generate_relay() {
             cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
             
             # 添加SS inbound
-            jq --argjson port "$SS_PORT" --arg psk "$SS_PSK" '
+            jq --argjson port "$SS_PORT" --rawfile psk <(printf '%s' "$SS_PSK") '
             .inbounds += [{
               "type": "shadowsocks",
               "listen": "::",
@@ -1175,16 +1302,51 @@ action_generate_relay() {
     fi
     
     PUBLIC_IP=$(get_public_ip)
-    RELAY_SCRIPT="/tmp/relay-install.sh"
+    local RELAY_SCRIPT
+    RELAY_SCRIPT=$(mktemp /etc/sing-box/relay-install.XXXXXX) || return 1
     
     info "正在生成线路机脚本: $RELAY_SCRIPT"
     
-    cat > "$RELAY_SCRIPT" <<'RELAY_EOF'
-#!/usr/bin/env bash
+    {
+        printf '%s\n' '#!/usr/bin/env bash'
+        printf 'INBOUND_IP=%q\n' "$PUBLIC_IP"
+        printf 'INBOUND_PORT=%q\n' "$SS_PORT"
+        printf 'INBOUND_METHOD=%q\n' "$SS_METHOD"
+        printf 'INBOUND_PASSWORD=%q\n' "$SS_PSK"
+        cat <<'RELAY_EOF'
 set -euo pipefail
 
 info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
 err()  { echo -e "\033[1;31m[ERR]\033[0m $*" >&2; }
+
+# 收紧现有凭据权限，并拒绝异常的文件类型或所有者。
+protect_credential_file() {
+    local file="$1"
+    if [[ -L "$file" || ( -e "$file" && ( ! -f "$file" || ! -O "$file" ) ) ]]; then
+        err "凭据路径不是当前用户拥有的常规文件: $file"
+        return 1
+    fi
+    if [[ -f "$file" ]]; then
+        chmod 0600 -- "$file"
+    fi
+}
+
+protect_credentials() {
+    local path
+    for path in /etc/sing-box /etc/sing-box/certs; do
+        if [[ -L "$path" || ( -e "$path" && ( ! -d "$path" || ! -O "$path" ) ) ]]; then
+            err "配置路径不是当前用户拥有的目录: $path"
+            return 1
+        fi
+        if [[ -d "$path" ]]; then
+            chmod 0700 -- "$path" || return 1
+        fi
+    done
+    for path in /etc/sing-box/{config.json,config.json.bak,config.json.tmp,.protocols,.config_cache,.config_cache.tmp,.config_cache.tmp2,.reality_pub,.reality_sid,uris.txt,ss_uri.txt,relay_uri.txt,certs/privkey.pem} "$@"; do
+        protect_credential_file "$path" || return 1
+    done
+}
+
 
 [ "$(id -u)" != "0" ] && err "必须以 root 运行" && exit 1
 
@@ -1225,6 +1387,12 @@ LISTEN_PORT="${USER_PORT:-$(shuf -i 20000-65000 -n 1 2>/dev/null || echo 20443)}
 
 mkdir -p /etc/sing-box
 
+umask 077
+protect_credentials
+[[ "$INBOUND_PORT" =~ ^[0-9]+$ ]] || { err "落地机端口无效"; exit 1; }
+INBOUND_IP_JSON=$(printf '%s' "$INBOUND_IP" | jq -Rs .)
+INBOUND_METHOD_JSON=$(printf '%s' "$INBOUND_METHOD" | jq -Rs .)
+INBOUND_PASSWORD_JSON=$(printf '%s' "$INBOUND_PASSWORD" | jq -Rs .)
 cat > /etc/sing-box/config.json <<EOF
 {
   "log": { "level": "info", "timestamp": true },
@@ -1251,10 +1419,10 @@ cat > /etc/sing-box/config.json <<EOF
   "outbounds": [
     {
       "type": "shadowsocks",
-      "server": "__INBOUND_IP__",
-      "server_port": __INBOUND_PORT__,
-      "method": "__INBOUND_METHOD__",
-      "password": "__INBOUND_PASSWORD__",
+      "server": $INBOUND_IP_JSON,
+      "server_port": $INBOUND_PORT,
+      "method": $INBOUND_METHOD_JSON,
+      "password": $INBOUND_PASSWORD_JSON,
       "tag": "relay-out"
     },
     { "type": "direct", "tag": "direct-out" }
@@ -1307,34 +1475,14 @@ echo "$RELAY_URI" > /etc/sing-box/relay_uri.txt
 
 echo ""
 info "✅ 安装完成"
-echo "=============== 中转节点 Reality 链接 ==============="
-echo "$RELAY_URI"
-echo "===================================================="
 echo ""
 info "💡 链接已保存到: /etc/sing-box/relay_uri.txt"
 info "💡 查看链接命令: cat /etc/sing-box/relay_uri.txt"
 RELAY_EOF
+    } > "$RELAY_SCRIPT"
 
-    # 替换占位符
-    sed -i "s|__INBOUND_IP__|$PUBLIC_IP|g" "$RELAY_SCRIPT"
-    sed -i "s|__INBOUND_PORT__|$SS_PORT|g" "$RELAY_SCRIPT"
-    sed -i "s|__INBOUND_METHOD__|$SS_METHOD|g" "$RELAY_SCRIPT"
-    sed -i "s|__INBOUND_PASSWORD__|$SS_PSK|g" "$RELAY_SCRIPT"
-    
-    chmod +x "$RELAY_SCRIPT"
-    
-    info "✅ 线路机脚本已生成: $RELAY_SCRIPT"
-    echo ""
-    info "请复制以下内容到线路机执行:"
-    echo "----------------------------------------"
-    cat "$RELAY_SCRIPT"
-    echo "----------------------------------------"
-    echo ""
-    info "在线路机执行命令示例："
-    echo "   nano /tmp/relay-install.sh 保存后执行"
-    echo "   chmod +x /tmp/relay-install.sh && bash /tmp/relay-install.sh"
-    echo ""
-    info "复制执行完成后，即可在线路机完成 sing-box 中转节点部署。"
+    info "线路机脚本已保存到: $RELAY_SCRIPT"
+    info "请通过安全通道将文件保存到线路机的 /root/relay-install.sh，再以 root 运行 bash /root/relay-install.sh。"
 }
 
 # 动态生成菜单
@@ -1452,5 +1600,6 @@ while true; do
 done
 SB_SCRIPT
 
-chmod +x "$SB_PATH"
+chmod 0700 "$SB_TEMP"
+mv -fT -- "$SB_TEMP" "$SB_PATH"
 info "✅ 管理脚本已创建,可输入 sb 打开管理面板"
